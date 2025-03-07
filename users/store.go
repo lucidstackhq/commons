@@ -3,10 +3,13 @@ package users
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"github.com/hashicorp/raft"
-	"github.com/hashicorp/raft-boltdb"
+	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"io"
 	"os"
+	"path"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,9 +23,17 @@ type Command struct {
 }
 
 type Store struct {
-	mu   sync.Mutex
-	data map[string]string
-	raft *raft.Raft
+	mu       sync.Mutex
+	data     map[string]string
+	raft     *raft.Raft
+	dataPath string
+}
+
+func NewStore(dataPath string) *Store {
+	return &Store{
+		data:     make(map[string]string),
+		dataPath: dataPath,
+	}
 }
 
 func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
@@ -50,12 +61,6 @@ func (s *Store) Restore(snapshot io.ReadCloser) error {
 	return nil
 }
 
-func NewStore() *Store {
-	return &Store{
-		data: make(map[string]string),
-	}
-}
-
 func (s *Store) Apply(log *raft.Log) interface{} {
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
@@ -69,12 +74,6 @@ func (s *Store) Apply(log *raft.Log) interface{} {
 	case "set":
 		s.data[cmd.Username] = cmd.Password
 		return nil
-	case "get":
-		password, exists := s.data[cmd.Username]
-		if !exists {
-			return fmt.Errorf("user not found")
-		}
-		return password
 	default:
 		return fmt.Errorf("unknown command")
 	}
@@ -86,9 +85,19 @@ func (s *Store) Set(username, password string) error {
 }
 
 func (s *Store) Get(username string) (string, error) {
-	cmd := Command{Op: "get", Username: username}
-	return s.query(cmd)
+	user, ok := s.data[username]
+	if !ok {
+		return "", fmt.Errorf("user not found")
+	}
+	return user, nil
 }
+
+func (s *Store) GetInfo() gin.H {
+	return gin.H{
+		"leader": s.raft.State() == raft.Leader,
+	}
+}
+
 func (s *Store) execute(cmd Command) error {
 	if s.raft.State() != raft.Leader {
 		return fmt.Errorf("not the leader")
@@ -103,50 +112,50 @@ func (s *Store) execute(cmd Command) error {
 	return future.Error()
 }
 
-func (s *Store) query(cmd Command) (string, error) {
-	data, err := json.Marshal(cmd)
-	if err != nil {
-		return "", err
-	}
-
-	future := s.raft.Apply(data, raftTimeout)
-	if err := future.Error(); err != nil {
-		return "", err
-	}
-
-	result, ok := future.Response().(string)
-	if !ok {
-		return "", fmt.Errorf("invalid response type")
-	}
-
-	return result, nil
-}
-
-func (s *Store) setupRaft(nodeID, raftAddr string) error {
+func (s *Store) setupRaft(raftAddr string, bootstrapServers string) error {
 	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID(nodeID)
+	config.LocalID = raft.ServerID(raftAddr)
 
-	snapshotStore, err := raft.NewFileSnapshotStore("./raft", 2, os.Stdout)
+	snapshotStore, err := raft.NewFileSnapshotStore(path.Join(s.dataPath, "raft"), 2, os.Stdout)
 	if err != nil {
 		return err
 	}
 
-	logStore, err := raftboltdb.NewBoltStore("./raft/logs.bolt")
+	logStore, err := raftboltdb.NewBoltStore(path.Join(s.dataPath, "raft", "logs.bolt"))
 	if err != nil {
 		return err
 	}
+
+	var bootstrapServersList []raft.Server
+	if len(bootstrapServers) != 0 {
+		bootstrapServerStringList := strings.Split(bootstrapServers, ",")
+		for _, bootstrapServerString := range bootstrapServerStringList {
+			bootstrapServerString = strings.TrimSpace(bootstrapServerString)
+			bootstrapServersList = append(bootstrapServersList, raft.Server{
+				ID:      raft.ServerID(bootstrapServerString),
+				Address: raft.ServerAddress(bootstrapServerString),
+			})
+		}
+	}
+
+	bootstrapServersList = append(bootstrapServersList, raft.Server{
+		ID:      config.LocalID,
+		Address: raft.ServerAddress(raftAddr),
+	})
 
 	transport, err := raft.NewTCPTransport(raftAddr, nil, 3, raftTimeout, os.Stdout)
 	if err != nil {
 		return err
 	}
 
-	raftStore := raft.NewInmemStore()
-
-	ra, err := raft.NewRaft(config, s, raftStore, logStore, snapshotStore, transport)
+	ra, err := raft.NewRaft(config, s, logStore, logStore, snapshotStore, transport)
 	if err != nil {
 		return err
 	}
+
+	ra.BootstrapCluster(raft.Configuration{
+		Servers: bootstrapServersList,
+	})
 
 	s.raft = ra
 	return nil
